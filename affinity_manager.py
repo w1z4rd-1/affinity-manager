@@ -516,8 +516,8 @@ class AffinityManagerApp:
         ttk.Label(legend_frame, text="Selected", font=('Segoe UI', 9)).grid(row=0, column=5)
         
         # Detected processes
-        detect_frame = ttk.LabelFrame(main, text="Detected Processes", padding=10)
-        detect_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        self.detect_frame = ttk.LabelFrame(main, text="Detected Processes", padding=10)
+        self.detect_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         
         self.process_labels = {}
         
@@ -581,7 +581,7 @@ class AffinityManagerApp:
         self.custom_groups[name] = (patterns, procs, selector)
         
         # Create label in detect frame
-        label = ttk.Label(self.selector_frame.master.master.winfo_children()[3], text="")  # detect_frame
+        label = ttk.Label(self.detect_frame, text="")
         label.grid(row=len(self.process_labels), column=0, sticky="w")
         self.process_labels[name] = label
         
@@ -601,7 +601,7 @@ class AffinityManagerApp:
             # Rebuild GUI
             for widget in self.selector_frame.winfo_children():
                 widget.destroy()
-            for widget in self.selector_frame.master.master.winfo_children()[3].winfo_children():
+            for widget in self.detect_frame.winfo_children():
                 widget.destroy()
             
             self.process_labels = {}
@@ -661,14 +661,20 @@ class AffinityManagerApp:
             count = len(self.other_procs)
             threads = sum(p['threads'] for p in self.other_procs)
             if self.other_procs:
-                # Find or create Other label
-                detect_frame = self.selector_frame.master.master.winfo_children()[3]
-                for child in detect_frame.winfo_children():
+                # Find or create Other label in detect_frame
+                found = False
+                for child in self.detect_frame.winfo_children():
                     if isinstance(child, ttk.Label):
                         text = child.cget('text')
-                        if 'Other:' in text or not text:
+                        if 'Other:' in text or (not text and not found):
                             child.config(text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
+                            found = True
                             break
+                
+                if not found:
+                    # Create new label if not found
+                    label = ttk.Label(self.detect_frame, text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
+                    label.grid(row=len(self.process_labels), column=0, sticky="w")
     
     def on_refresh(self):
         self.refresh_processes()
@@ -738,13 +744,23 @@ def run_as_admin():
         messagebox.showerror("Error", f"Failed to elevate privileges:\n{e}")
 
 def main():
-    if not is_admin():
-        run_as_admin()
-        return
-    
-    root = tk.Tk()
-    app = AffinityManagerApp(root)
-    root.mainloop()
+    try:
+        if not is_admin():
+            run_as_admin()
+            return
+        
+        root = tk.Tk()
+        app = AffinityManagerApp(root)
+        root.mainloop()
+    except Exception as e:
+        import traceback
+        error_msg = f"Error: {e}\n\n{traceback.format_exc()}"
+        print(error_msg)
+        try:
+            messagebox.showerror("Startup Error", error_msg)
+        except:
+            pass
+        input("Press Enter to exit...")
 
 if __name__ == "__main__":
     main()
