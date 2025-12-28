@@ -6,18 +6,23 @@ Created by wizard1
 """
 import sys
 import os
+import json
 import ctypes
 import psutil
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-MC_PATTERNS = ['javaw', 'java', 'lunar', 'badlion', 'feather']
-DISCORD_PATTERNS = ['discord']
-OBS_PATTERNS = ['obs64', 'obs32', 'obs-browser']
+# Default process patterns - can be extended by user
+DEFAULT_CUSTOM_PROGRAMS = {
+    'Minecraft': ['javaw', 'java', 'lunar', 'badlion', 'feather'],
+    'Discord': ['discord'],
+    'OBS': ['obs64', 'obs32', 'obs-browser']
+}
+
 SKIP_ALWAYS = {
     'system', 'system idle process', 'idle', 'registry', 'memcompression', 'memory compression',
     'smss.exe', 'csrss.exe', 'wininit.exe', 'services.exe', 'lsass.exe', 'winlogon.exe',
@@ -26,16 +31,19 @@ SKIP_ALWAYS = {
     'ctfmon.exe', 'audiodg.exe', 'mc-fw-host.exe'
 }
 
-# Colors - Modern dark theme palette
-BG_DARK = "#1a1a2e"           # Dark background
-BG_TRACK = "#16213e"          # Track background
-P_CORE_BASE = "#0f3d3e"       # P-core unselected (dark teal)
-P_CORE_SELECTED = "#00d9a0"   # P-core selected (bright teal/mint)
-E_CORE_BASE = "#1e3a5f"       # E-core unselected (dark blue)
-E_CORE_SELECTED = "#00b4d8"   # E-core selected (bright cyan)
-TEXT_DIM = "#6c757d"          # Dimmed text
-TEXT_BRIGHT = "#ffffff"       # Bright text
-BORDER_SELECTED = "#ffd700"   # Gold border for selection
+# Colors - Dark theme palette
+BG_MAIN = "#1e1e1e"           # Main background
+BG_FRAME = "#252526"          # Frame background
+BG_TRACK = "#2d2d30"          # Track background
+P_CORE_BASE = "#0e4429"       # P-core unselected (dark green)
+P_CORE_SELECTED = "#26a641"   # P-core selected (green)
+E_CORE_BASE = "#0969da"       # E-core unselected (blue)
+E_CORE_SELECTED = "#54aeff"   # E-core selected (light blue)
+TEXT_DIM = "#8b949e"          # Dimmed text
+TEXT_BRIGHT = "#e6edf3"       # Bright text
+BORDER_SELECTED = "#ffa657"   # Orange border for selection
+BTN_BG = "#238636"            # Button background
+BTN_FG = "#ffffff"            # Button foreground
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -94,7 +102,7 @@ def find_processes(patterns):
     for proc in psutil.process_iter(['pid', 'name', 'cpu_affinity', 'num_threads']):
         try:
             name = proc.info['name'].lower()
-            if any(p in name for p in patterns):
+            if any(p.lower() in name for p in patterns):
                 procs.append({
                     'pid': proc.pid,
                     'name': proc.info['name'],
@@ -119,15 +127,12 @@ def find_other_processes(known_pids):
             pid = proc.info['pid']
             name = (proc.info['name'] or '').lower()
 
-            # skip ones we already target elsewhere
             if pid in known_pids:
                 continue
 
-            # skip empty or critical names
             if not name or name in SKIP_ALWAYS:
                 continue
 
-            # keep only processes owned by the current user when known, to avoid system services
             if current_user and proc.info.get('username') and proc.info['username'].lower() != current_user.lower():
                 continue
 
@@ -184,6 +189,26 @@ def set_affinity_with_debug(procs, cores, app_name):
             })
     return results
 
+def load_custom_programs():
+    """Load custom program definitions from config file."""
+    config_path = os.path.join(os.path.dirname(sys.argv[0]), 'affinity_config.json')
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return dict(DEFAULT_CUSTOM_PROGRAMS)
+
+def save_custom_programs(programs):
+    """Save custom program definitions to config file."""
+    config_path = os.path.join(os.path.dirname(sys.argv[0]), 'affinity_config.json')
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(programs, f, indent=2)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to save config: {e}")
+
 # ============================================================================
 # CORE SELECTOR WIDGET
 # ============================================================================
@@ -197,12 +222,12 @@ class CoreSelector(tk.Canvas):
         self.cpu_info = cpu_info
         self.total_cores = cpu_info['logical']
         self.core_types = cpu_info['core_types']
-        self.threads_per_core = cpu_info.get('threads_per_core', 1)
-        self.physical_cores = max(1, cpu_info.get('physical', self.total_cores))
+        self.threads_per_core = cpu_info['threads_per_core']
+        self.physical_cores = cpu_info['physical']
         
         # Selection range (start, end) - both inclusive
         self.start = 0
-        self.end = cpu_info['p_count'] - 1
+        self.end = self.total_cores - 1
         
         # Drag state
         self.drag_anchor = None
@@ -212,13 +237,13 @@ class CoreSelector(tk.Canvas):
         self.core_height = 36
         self.core_spacing = 4
         self.padding_x = 12
-        self.padding_y = 16  # extra room for physical-core labels
+        self.padding_y = 10
         self.corner_radius = 6
         
         # Configure size
-        width = self.total_cores * (self.core_width + self.core_spacing) - self.core_spacing + self.padding_x * 2 + 110
-        height = self.core_height + self.padding_y * 2 + 6
-        self.configure(width=width, height=height, bg=BG_DARK, highlightthickness=0)
+        width = self.total_cores * (self.core_width + self.core_spacing) - self.core_spacing + self.padding_x * 2 + 90
+        height = self.core_height + self.padding_y * 2
+        self.configure(width=width, height=height, bg=BG_MAIN, highlightthickness=0)
         
         # Bind mouse events
         self.bind('<Button-1>', self.on_mouse_down)
@@ -286,28 +311,6 @@ class CoreSelector(tk.Canvas):
         track_x2 = self.padding_x + self.total_cores * (self.core_width + self.core_spacing) - self.core_spacing + 4
         track_y2 = self.padding_y + self.core_height + 4
         self.create_rounded_rect(track_x1, track_y1, track_x2, track_y2, 8, fill=BG_TRACK, outline='')
-
-        # Shade physical core groupings to show which logical cores share hardware
-        if self.threads_per_core > 1:
-            group_width = self.threads_per_core * (self.core_width + self.core_spacing) - self.core_spacing
-            for g in range(self.physical_cores):
-                gx1 = self.padding_x + g * group_width
-                gx2 = gx1 + group_width
-                # subtle overlay strip behind the group
-                self.create_rectangle(
-                    gx1, track_y1,
-                    gx2, track_y2,
-                    fill='#0c1a2f' if g % 2 == 0 else '#0a1323',
-                    outline=''
-                )
-                # physical core index label above group
-                self.create_text(
-                    (gx1 + gx2) / 2,
-                    track_y1 - 8,
-                    text=f"Phys {g}",
-                    font=('Segoe UI', 8, 'bold'),
-                    fill='#cbd5e1'
-                )
         
         # Draw each core
         for i in range(self.total_cores):
@@ -355,19 +358,6 @@ class CoreSelector(tk.Canvas):
                 font=('Segoe UI', 8),
                 fill=text_color if is_selected else '#4a5568'
             )
-
-        # Draw separators between physical cores to highlight HT siblings
-        if self.threads_per_core > 1:
-            step = self.threads_per_core * (self.core_width + self.core_spacing)
-            for g in range(1, self.physical_cores):
-                sx = self.padding_x + g * step - self.core_spacing / 2
-                self.create_line(
-                    sx, track_y1 + 2,
-                    sx, track_y2 - 2,
-                    fill='#ffb703',
-                    width=2,
-                    dash=(3, 3)
-                )
         
         # Draw selection info
         info_x = self.padding_x + self.total_cores * (self.core_width + self.core_spacing) + 10
@@ -406,36 +396,94 @@ class AffinityManagerApp:
         self.root.title("Affinity Manager")
         self.root.resizable(True, True)
         try:
-            self.root.minsize(1100, 720)
-            self.root.geometry("1200x780")
+            self.root.minsize(1100, 750)
+            self.root.geometry("1200x820")
         except Exception:
             pass
-        self.root.configure(bg='#f0f0f0')
+        
+        # Apply dark theme
+        self.root.configure(bg=BG_MAIN)
+        self.setup_dark_theme()
         
         self.cpu_info = get_cpu_info()
+        self.custom_programs = load_custom_programs()
+        self.custom_groups = {}  # name -> (patterns, procs, selector)
+        
         self.refresh_processes()
         self.build_gui()
-        self.apply_recommended()
+        self.load_current_affinities()
+    
+    def setup_dark_theme(self):
+        """Configure ttk dark theme."""
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        style.configure('.', background=BG_FRAME, foreground=TEXT_BRIGHT, 
+                       fieldbackground=BG_TRACK, borderwidth=0)
+        style.configure('TFrame', background=BG_MAIN)
+        style.configure('TLabel', background=BG_MAIN, foreground=TEXT_BRIGHT)
+        style.configure('TLabelframe', background=BG_MAIN, foreground=TEXT_BRIGHT, 
+                       borderwidth=1, relief='solid')
+        style.configure('TLabelframe.Label', background=BG_MAIN, foreground=TEXT_BRIGHT)
+        style.configure('TButton', background=BTN_BG, foreground=BTN_FG, 
+                       borderwidth=1, focuscolor='none', padding=6)
+        style.map('TButton', background=[('active', '#2ea043')])
     
     def refresh_processes(self):
-        self.mc_procs = find_processes(MC_PATTERNS)
-        self.dc_procs = find_processes(DISCORD_PATTERNS)
-        self.obs_procs = find_processes(OBS_PATTERNS)
-
-        known_pids = {p['pid'] for p in self.mc_procs + self.dc_procs + self.obs_procs}
+        """Refresh all process lists including custom programs."""
+        # Clear custom groups proc lists
+        for name in self.custom_groups:
+            patterns = self.custom_groups[name][0]
+            procs = find_processes(patterns)
+            selector = self.custom_groups[name][2]
+            self.custom_groups[name] = (patterns, procs, selector)
+        
+        # Collect all known PIDs
+        all_known = []
+        for name, (patterns, procs, _) in self.custom_groups.items():
+            all_known.extend(procs)
+        
+        known_pids = {p['pid'] for p in all_known}
         self.other_procs = find_other_processes(known_pids)
     
+    def load_current_affinities(self):
+        """Set selectors to show current affinity instead of recommended."""
+        for name, (patterns, procs, selector) in self.custom_groups.items():
+            if procs:
+                # Use first process's affinity as representative
+                cores = sorted(procs[0]['cores'])
+                if cores:
+                    selector.set_range(cores[0], cores[-1])
+        
+        # Set "Other" to all cores by default
+        if hasattr(self, 'other_selector'):
+            self.other_selector.set_range(0, self.cpu_info['logical'] - 1)
+    
     def build_gui(self):
-        main = ttk.Frame(self.root, padding=15)
+        # Create main scrollable frame
+        main_canvas = tk.Canvas(self.root, bg=BG_MAIN, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=main_canvas.yview)
+        main_frame = ttk.Frame(main_canvas)
+        
+        main_frame.bind("<Configure>", lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all")))
+        
+        main_canvas.create_window((0, 0), window=main_frame, anchor="nw")
+        main_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        main_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        main = ttk.Frame(main_frame, padding=15)
         main.grid(row=0, column=0, sticky="nsew")
         
         # Title
-        ttk.Label(main, text="🎮 Affinity Manager", 
-                 font=('Segoe UI', 14, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0, 2))
-        ttk.Label(main, text="by wizard1", 
-                 font=('Segoe UI', 9, 'italic')).grid(row=1, column=0, columnspan=2, pady=(0, 10))
+        title_label = ttk.Label(main, text="🎮 Affinity Manager", 
+                 font=('Segoe UI', 14, 'bold'))
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 2))
+        author_label = ttk.Label(main, text="by wizard1", font=('Segoe UI', 9, 'italic'))
+        author_label.grid(row=1, column=0, columnspan=2, pady=(0, 10))
         
-        # CPU Info with legend
+        # CPU Info
         info_frame = ttk.LabelFrame(main, text="CPU Info", padding=10)
         info_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         
@@ -451,21 +499,18 @@ class AffinityManagerApp:
         legend_frame = ttk.Frame(info_frame)
         legend_frame.grid(row=1, column=0, sticky='w', pady=(8, 0))
         
-        # P-core legend
-        p_canvas = tk.Canvas(legend_frame, width=24, height=16, highlightthickness=0, bg='#f0f0f0')
+        p_canvas = tk.Canvas(legend_frame, width=24, height=16, highlightthickness=0, bg=BG_MAIN)
         p_canvas.grid(row=0, column=0, padx=(0, 5))
         p_canvas.create_rectangle(2, 2, 22, 14, fill=P_CORE_SELECTED, outline='')
         ttk.Label(legend_frame, text=f"P-core ({cpu['p_count']})", font=('Segoe UI', 9)).grid(row=0, column=1, padx=(0, 20))
         
-        # E-core legend
         if cpu['e_count'] > 0:
-            e_canvas = tk.Canvas(legend_frame, width=24, height=16, highlightthickness=0, bg='#f0f0f0')
+            e_canvas = tk.Canvas(legend_frame, width=24, height=16, highlightthickness=0, bg=BG_MAIN)
             e_canvas.grid(row=0, column=2, padx=(0, 5))
             e_canvas.create_rectangle(2, 2, 22, 14, fill=E_CORE_SELECTED, outline='')
             ttk.Label(legend_frame, text=f"E-core ({cpu['e_count']})", font=('Segoe UI', 9)).grid(row=0, column=3, padx=(0, 20))
         
-        # Selected legend
-        s_canvas = tk.Canvas(legend_frame, width=24, height=16, highlightthickness=0, bg='#f0f0f0')
+        s_canvas = tk.Canvas(legend_frame, width=24, height=16, highlightthickness=0, bg=BG_MAIN)
         s_canvas.grid(row=0, column=4, padx=(0, 5))
         s_canvas.create_rectangle(2, 2, 22, 14, fill='#333', outline=BORDER_SELECTED, width=2)
         ttk.Label(legend_frame, text="Selected", font=('Segoe UI', 9)).grid(row=0, column=5)
@@ -474,145 +519,193 @@ class AffinityManagerApp:
         detect_frame = ttk.LabelFrame(main, text="Detected Processes", padding=10)
         detect_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         
-        self.mc_label = ttk.Label(detect_frame, text="")
-        self.mc_label.grid(row=0, column=0, sticky="w")
-        self.dc_label = ttk.Label(detect_frame, text="")
-        self.dc_label.grid(row=1, column=0, sticky="w")
-        self.obs_label = ttk.Label(detect_frame, text="")
-        self.obs_label.grid(row=2, column=0, sticky="w")
-        self.other_label = ttk.Label(detect_frame, text="")
-        self.other_label.grid(row=3, column=0, sticky="w")
-        
-        self.update_process_labels()
+        self.process_labels = {}
         
         # Core selectors
-        selector_frame = ttk.LabelFrame(main, text="Core Allocation — click and drag to select range", padding=10)
-        selector_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        self.selector_frame = ttk.LabelFrame(main, text="Core Allocation — click and drag to select range", padding=10)
+        self.selector_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         
-        # Minecraft selector
-        mc_row = ttk.Frame(selector_frame)
-        mc_row.grid(row=0, column=0, sticky='w', pady=4)
-        ttk.Label(mc_row, text="Minecraft", font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
-        self.mc_selector = CoreSelector(mc_row, self.cpu_info)
-        self.mc_selector.pack(side='left', padx=(5, 0))
+        self.selector_row_idx = 0
         
-        # Discord selector
-        dc_row = ttk.Frame(selector_frame)
-        dc_row.grid(row=1, column=0, sticky='w', pady=4)
-        ttk.Label(dc_row, text="Discord", font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
-        self.dc_selector = CoreSelector(dc_row, self.cpu_info)
-        self.dc_selector.pack(side='left', padx=(5, 0))
+        # Build selectors for each custom program
+        for name, patterns in self.custom_programs.items():
+            self.add_program_selector(name, patterns)
         
-        # OBS selector
-        obs_row = ttk.Frame(selector_frame)
-        obs_row.grid(row=2, column=0, sticky='w', pady=4)
-        ttk.Label(obs_row, text="OBS", font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
-        self.obs_selector = CoreSelector(obs_row, self.cpu_info)
-        self.obs_selector.pack(side='left', padx=(5, 0))
-
-        # Other processes selector
-        other_row = ttk.Frame(selector_frame)
-        other_row.grid(row=3, column=0, sticky='w', pady=4)
+        # "Other" processes selector
+        other_row = ttk.Frame(self.selector_frame)
+        other_row.grid(row=self.selector_row_idx, column=0, sticky='w', pady=4)
         ttk.Label(other_row, text="Other", font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
         self.other_selector = CoreSelector(other_row, self.cpu_info)
         self.other_selector.pack(side='left', padx=(5, 0))
+        self.selector_row_idx += 1
+        
+        self.update_process_labels()
+        
+        # Add program button
+        add_frame = ttk.Frame(main)
+        add_frame.grid(row=5, column=0, columnspan=2, pady=(0, 10))
+        ttk.Button(add_frame, text="+ Add Custom Program", command=self.on_add_program).pack()
         
         # Buttons
         btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
         
         ttk.Button(btn_frame, text="↻ Refresh", command=self.on_refresh).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="★ Recommended", command=self.apply_recommended).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="✓ Apply", command=self.on_apply).pack(side="left", padx=5)
         
         # Status
-        self.status_label = ttk.Label(main, text="", font=('Segoe UI', 9))
-        self.status_label.grid(row=6, column=0, columnspan=2)
+        self.status_label = ttk.Label(main, text="Ready - showing current affinity settings", font=('Segoe UI', 9))
+        self.status_label.grid(row=7, column=0, columnspan=2)
+    
+    def add_program_selector(self, name, patterns):
+        """Add a program selector row."""
+        # Find processes
+        procs = find_processes(patterns)
+        
+        # Create selector row
+        row = ttk.Frame(self.selector_frame)
+        row.grid(row=self.selector_row_idx, column=0, sticky='w', pady=4)
+        
+        label_frame = ttk.Frame(row)
+        label_frame.pack(side='left')
+        ttk.Label(label_frame, text=name, font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
+        
+        # Add remove button for custom (non-default) programs
+        if name not in DEFAULT_CUSTOM_PROGRAMS:
+            ttk.Button(label_frame, text="✕", width=2, command=lambda: self.remove_program(name)).pack(side='left', padx=(2, 0))
+        
+        selector = CoreSelector(row, self.cpu_info)
+        selector.pack(side='left', padx=(5, 0))
+        
+        # Store in custom_groups
+        self.custom_groups[name] = (patterns, procs, selector)
+        
+        # Create label in detect frame
+        label = ttk.Label(self.selector_frame.master.master.winfo_children()[3], text="")  # detect_frame
+        label.grid(row=len(self.process_labels), column=0, sticky="w")
+        self.process_labels[name] = label
+        
+        self.selector_row_idx += 1
+    
+    def remove_program(self, name):
+        """Remove a custom program."""
+        if name in DEFAULT_CUSTOM_PROGRAMS:
+            messagebox.showwarning("Cannot Remove", "Cannot remove default programs.")
+            return
+        
+        if messagebox.askyesno("Confirm", f"Remove {name}?"):
+            del self.custom_programs[name]
+            del self.custom_groups[name]
+            save_custom_programs(self.custom_programs)
+            
+            # Rebuild GUI
+            for widget in self.selector_frame.winfo_children():
+                widget.destroy()
+            for widget in self.selector_frame.master.master.winfo_children()[3].winfo_children():
+                widget.destroy()
+            
+            self.process_labels = {}
+            self.selector_row_idx = 0
+            
+            for pname, patterns in self.custom_programs.items():
+                self.add_program_selector(pname, patterns)
+            
+            # Re-add Other
+            other_row = ttk.Frame(self.selector_frame)
+            other_row.grid(row=self.selector_row_idx, column=0, sticky='w', pady=4)
+            ttk.Label(other_row, text="Other", font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
+            self.other_selector = CoreSelector(other_row, self.cpu_info)
+            self.other_selector.pack(side='left', padx=(5, 0))
+            
+            self.refresh_processes()
+            self.update_process_labels()
+    
+    def on_add_program(self):
+        """Add a new custom program."""
+        name = simpledialog.askstring("Add Program", "Enter program name:")
+        if not name:
+            return
+        
+        if name in self.custom_programs:
+            messagebox.showwarning("Duplicate", "Program already exists.")
+            return
+        
+        pattern = simpledialog.askstring("Add Program", f"Enter process name pattern for {name}:\n(e.g., chrome, firefox.exe)")
+        if not pattern:
+            return
+        
+        patterns = [p.strip() for p in pattern.split(',')]
+        self.custom_programs[name] = patterns
+        save_custom_programs(self.custom_programs)
+        
+        # Add selector
+        self.add_program_selector(name, patterns)
+        self.refresh_processes()
+        self.update_process_labels()
+        self.status_label.config(text=f"Added {name}")
     
     def update_process_labels(self):
-        def fmt(name, procs, show_names=True):
+        def fmt(name, procs):
             if not procs:
                 return f"❌ {name}: Not running"
+            names = set(p['name'] for p in procs)
             threads = sum(p['threads'] for p in procs)
-            if show_names:
-                names = set(p['name'] for p in procs)
-                return f"✅ {name}: {', '.join(names)} ({threads} threads)"
-            return f"✅ {name}: {threads} threads"
+            return f"✅ {name}: {', '.join(names)} ({threads} threads)"
         
-        self.mc_label.config(text=fmt("Minecraft", self.mc_procs))
-        self.dc_label.config(text=fmt("Discord", self.dc_procs))
-        self.obs_label.config(text=fmt("OBS", self.obs_procs))
-        if self.other_procs:
+        for name, (patterns, procs, selector) in self.custom_groups.items():
+            if name in self.process_labels:
+                self.process_labels[name].config(text=fmt(name, procs))
+        
+        # Update Other label
+        if hasattr(self, 'other_procs'):
             count = len(self.other_procs)
             threads = sum(p['threads'] for p in self.other_procs)
-            self.other_label.config(text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
-        else:
-            self.other_label.config(text="❌ Other: none (user processes only; excludes system processes)")
+            if self.other_procs:
+                # Find or create Other label
+                detect_frame = self.selector_frame.master.master.winfo_children()[3]
+                for child in detect_frame.winfo_children():
+                    if isinstance(child, ttk.Label):
+                        text = child.cget('text')
+                        if 'Other:' in text or not text:
+                            child.config(text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
+                            break
     
     def on_refresh(self):
         self.refresh_processes()
         self.update_process_labels()
+        self.load_current_affinities()
         self.status_label.config(text="Refreshed!")
-    
-    def apply_recommended(self):
-        """Apply recommended core split."""
-        cpu = self.cpu_info
-        
-        if cpu['e_count'] > 0:
-            # Hybrid CPU: MC gets P-cores, Discord/OBS split E-cores
-            mc_start, mc_end = 0, cpu['p_count'] - 1
-            
-            e_start = cpu['p_count']
-            e_mid = e_start + cpu['e_count'] // 2
-            
-            dc_start, dc_end = e_start, e_mid - 1
-            obs_start, obs_end = e_mid, cpu['logical'] - 1
-
-            # Other processes -> keep to last part of E-cores (or last cores)
-            other_end = cpu['logical'] - 1
-            other_start = max(e_mid, other_end - max(1, cpu['threads_per_core']))
-        else:
-            # Standard CPU: 60% MC, 20% Discord, 20% OBS
-            total = cpu['logical']
-            mc_end = int(total * 0.6) - 1
-            dc_start = mc_end + 1
-            dc_end = int(total * 0.8) - 1
-            obs_start = dc_end + 1
-            obs_end = total - 1
-            mc_start = 0
-            other_end = total - 1
-            other_start = max(int(total * 0.9), other_end - 1)
-        
-        self.mc_selector.set_range(mc_start, mc_end)
-        self.dc_selector.set_range(dc_start, dc_end)
-        self.obs_selector.set_range(obs_start, obs_end)
-        self.other_selector.set_range(other_start, other_end)
     
     def on_apply(self):
         all_results = []
         errors = []
         
-        # Apply each
-        apps = [
-            ('Minecraft', self.mc_procs, self.mc_selector.get_cores()),
-            ('Discord', self.dc_procs, self.dc_selector.get_cores()),
-            ('OBS', self.obs_procs, self.obs_selector.get_cores()),
-            ('Other', self.other_procs, self.other_selector.get_cores())
-        ]
-        
-        for app_name, procs, cores in apps:
+        # Apply for each custom program
+        for name, (patterns, procs, selector) in self.custom_groups.items():
+            cores = selector.get_cores()
             if not procs or not cores:
                 continue
             
-            results = set_affinity_with_debug(procs, cores, app_name)
+            results = set_affinity_with_debug(procs, cores, name)
             
             ok = sum(1 for r in results if r['success'])
             failed = [r for r in results if not r['success']]
             
-            all_results.append(f"{app_name}: {ok} OK → Cores {min(cores)}-{max(cores)}")
+            all_results.append(f"{name}: {ok} OK → Cores {min(cores)}-{max(cores)}")
             
             for f in failed:
                 errors.append(f"❌ {f['name']} (PID {f['pid']}):\n   {f['error']}")
+        
+        # Apply for Other
+        if hasattr(self, 'other_procs') and self.other_procs:
+            cores = self.other_selector.get_cores()
+            if cores:
+                results = set_affinity_with_debug(self.other_procs, cores, "Other")
+                ok = sum(1 for r in results if r['success'])
+                failed = [r for r in results if not r['success']]
+                all_results.append(f"Other: {ok} OK → Cores {min(cores)}-{max(cores)}")
+                for f in failed:
+                    errors.append(f"❌ {f['name']} (PID {f['pid']}):\n   {f['error']}")
         
         if not all_results:
             messagebox.showwarning("Warning", "No processes to update!")
@@ -621,7 +714,9 @@ class AffinityManagerApp:
         msg = "Affinity applied:\n\n" + "\n".join(all_results)
         
         if errors:
-            msg += "\n\n⚠️ ERRORS:\n\n" + "\n\n".join(errors)
+            msg += "\n\n⚠️ ERRORS:\n\n" + "\n\n".join(errors[:5])  # Limit to first 5 errors
+            if len(errors) > 5:
+                msg += f"\n\n... and {len(errors) - 5} more errors"
             messagebox.showwarning("Partial Success", msg)
         else:
             messagebox.showinfo("Success", msg)
@@ -635,35 +730,19 @@ class AffinityManagerApp:
 def run_as_admin():
     """Relaunch the script with admin privileges via UAC."""
     try:
-        # Get the Python executable and script path
         script = sys.argv[0]
-        
-        # Use ShellExecute to run with 'runas' verb (triggers UAC)
         ctypes.windll.shell32.ShellExecuteW(
-            None,           # hwnd
-            "runas",        # operation - triggers UAC elevation
-            sys.executable, # program - python.exe
-            f'"{script}"',  # parameters - this script
-            None,           # directory
-            1               # show window
+            None, "runas", sys.executable, f'"{script}"', None, 1
         )
     except Exception as e:
         messagebox.showerror("Error", f"Failed to elevate privileges:\n{e}")
 
 def main():
     if not is_admin():
-        # Relaunch with admin rights
         run_as_admin()
         return
     
     root = tk.Tk()
-    
-    style = ttk.Style()
-    if 'vista' in style.theme_names():
-        style.theme_use('vista')
-    elif 'clam' in style.theme_names():
-        style.theme_use('clam')
-    
     app = AffinityManagerApp(root)
     root.mainloop()
 
