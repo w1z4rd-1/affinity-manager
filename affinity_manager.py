@@ -11,13 +11,24 @@ import ctypes
 import psutil
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+import threading
+import time
+
+# Debug timing
+DEBUG_TIMING = True
+_start_time = time.perf_counter()
+
+def debug_ts(msg):
+    if DEBUG_TIMING:
+        elapsed = (time.perf_counter() - _start_time) * 1000
+        print(f"[{elapsed:8.1f}ms] {msg}")
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# Default process patterns - can be extended by user
-DEFAULT_CUSTOM_PROGRAMS = {
+# Known process patterns to check
+KNOWN_PATTERNS = {
     'Minecraft': ['javaw', 'java', 'lunar', 'badlion', 'feather'],
     'Discord': ['discord'],
     'OBS': ['obs64', 'obs32', 'obs-browser']
@@ -28,8 +39,11 @@ SKIP_ALWAYS = {
     'smss.exe', 'csrss.exe', 'wininit.exe', 'services.exe', 'lsass.exe', 'winlogon.exe',
     'dwm.exe', 'fontdrvhost.exe', 'sihost.exe', 'startmenuexperiencehost.exe',
     'shellexperiencehost.exe', 'searchui.exe', 'searchapp.exe', 'runtimebroker.exe',
-    'ctfmon.exe', 'audiodg.exe', 'mc-fw-host.exe'
+    'ctfmon.exe', 'audiodg.exe', 'mc-fw-host.exe', 'affinity_manager.exe'
 }
+
+# Thresholds for warnings
+MAX_THREADS_PER_CORE = 300  # Warn if threads/core exceeds this
 
 # Colors - Dark theme palette
 BG_MAIN = "#1e1e1e"           # Main background
@@ -97,31 +111,79 @@ def get_cpu_info():
         'threads_per_core': threads_per_core
     }
 
-def find_processes(patterns):
-    procs = []
-    for proc in psutil.process_iter(['pid', 'name', 'cpu_affinity', 'num_threads']):
+def discover_all_processes_single_pass():
+    """Single pass through all processes - discovers known patterns AND top CPU at once."""
+    debug_ts("discover_all_processes_single_pass start")
+    
+    try:
+        current_user = psutil.Process(os.getpid()).username()
+    except Exception:
+        current_user = None
+    
+    my_pid = os.getpid()
+    
+    # Results by category
+    results = {name: [] for name in KNOWN_PATTERNS.keys()}
+    top_cpu_candidates = []
+    
+    debug_ts("starting process iteration")
+    for proc in psutil.process_iter(['pid', 'name', 'cpu_affinity', 'num_threads', 'cpu_percent', 'username']):
         try:
-            name = proc.info['name'].lower()
-            if any(p.lower() in name for p in patterns):
-                procs.append({
-                    'pid': proc.pid,
-                    'name': proc.info['name'],
-                    'threads': proc.info['num_threads'],
-                    'cores': set(proc.cpu_affinity()),
-                    'proc': proc
-                })
+            pid = proc.info['pid']
+            name_lower = (proc.info['name'] or '').lower()
+            
+            if not name_lower or pid == my_pid:
+                continue
+            
+            proc_data = {
+                'pid': pid,
+                'name': proc.info['name'],
+                'threads': proc.info['num_threads'],
+                'cores': set(proc.cpu_affinity()),
+                'cpu_percent': proc.info.get('cpu_percent', 0) or 0,
+                'proc': proc
+            }
+            
+            # Check against known patterns
+            matched = False
+            for category, patterns in KNOWN_PATTERNS.items():
+                if any(p.lower() in name_lower for p in patterns):
+                    results[category].append(proc_data)
+                    matched = True
+                    break
+            
+            # If not matched to known category, consider for top CPU
+            if not matched and name_lower not in SKIP_ALWAYS:
+                if current_user and proc.info.get('username'):
+                    if proc.info['username'].lower() != current_user.lower():
+                        continue
+                
+                if proc_data['cpu_percent'] > 0.5:
+                    top_cpu_candidates.append(proc_data)
+                    
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    return procs
+            continue
+    
+    debug_ts("process iteration done")
+    
+    # Get top CPU process
+    top_cpu = []
+    if top_cpu_candidates:
+        top_cpu = sorted(top_cpu_candidates, key=lambda x: x['cpu_percent'], reverse=True)[:1]
+    
+    debug_ts(f"discover_all_processes_single_pass done: MC={len(results.get('Minecraft',[]))}, Discord={len(results.get('Discord',[]))}, OBS={len(results.get('OBS',[]))}, topCPU={len(top_cpu)}")
+    return results, top_cpu
 
 def find_other_processes(known_pids):
     """Find user-owned processes not in known sets and not critical OS services."""
+    debug_ts("find_other_processes start")
     procs = []
     try:
         current_user = psutil.Process(os.getpid()).username()
     except Exception:
         current_user = None
 
+    debug_ts("find_other_processes iterating")
     for proc in psutil.process_iter(['pid', 'name', 'cpu_affinity', 'num_threads', 'username']):
         try:
             pid = proc.info['pid']
@@ -145,6 +207,7 @@ def find_other_processes(known_pids):
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+    debug_ts(f"find_other_processes done, found {len(procs)}")
     return procs
 
 def set_affinity_with_debug(procs, cores, app_name):
@@ -189,26 +252,6 @@ def set_affinity_with_debug(procs, cores, app_name):
             })
     return results
 
-def load_custom_programs():
-    """Load custom program definitions from config file."""
-    config_path = os.path.join(os.path.dirname(sys.argv[0]), 'affinity_config.json')
-    try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return dict(DEFAULT_CUSTOM_PROGRAMS)
-
-def save_custom_programs(programs):
-    """Save custom program definitions to config file."""
-    config_path = os.path.join(os.path.dirname(sys.argv[0]), 'affinity_config.json')
-    try:
-        with open(config_path, 'w') as f:
-            json.dump(programs, f, indent=2)
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to save config: {e}")
-
 # ============================================================================
 # CORE SELECTOR WIDGET
 # ============================================================================
@@ -225,7 +268,7 @@ class CoreSelector(tk.Canvas):
         self.threads_per_core = cpu_info['threads_per_core']
         self.physical_cores = cpu_info['physical']
         
-        # Selection range (start, end) - both inclusive
+        # Selection range (start, end) - both inclusive, default to all cores
         self.start = 0
         self.end = self.total_cores - 1
         
@@ -392,6 +435,7 @@ class CoreSelector(tk.Canvas):
 
 class AffinityManagerApp:
     def __init__(self, root):
+        debug_ts("AffinityManagerApp.__init__ start")
         self.root = root
         self.root.title("Affinity Manager")
         self.root.resizable(True, True)
@@ -403,15 +447,25 @@ class AffinityManagerApp:
         
         # Apply dark theme
         self.root.configure(bg=BG_MAIN)
+        debug_ts("setup_dark_theme start")
         self.setup_dark_theme()
+        debug_ts("setup_dark_theme done")
         
+        debug_ts("get_cpu_info start")
         self.cpu_info = get_cpu_info()
-        self.custom_programs = load_custom_programs()
-        self.custom_groups = {}  # name -> (patterns, procs, selector)
+        debug_ts("get_cpu_info done")
+        self.active_groups = {}  # name -> (patterns, procs, selector, label)
+        self.other_procs = []
+        self.other_discovery_done = False
         
-        self.refresh_processes()
-        self.build_gui()
-        self.load_current_affinities()
+        debug_ts("refresh_processes_sync start")
+        self.refresh_processes_sync()  # Sync discovery of known patterns + top CPU FIRST
+        debug_ts("refresh_processes_sync done")
+        debug_ts("build_gui start")
+        self.build_gui()  # Then build GUI with discovered processes
+        debug_ts("build_gui done")
+        self.start_async_other_discovery()  # Async discovery of "Other"
+        debug_ts("AffinityManagerApp.__init__ done")
     
     def setup_dark_theme(self):
         """Configure ttk dark theme."""
@@ -427,37 +481,65 @@ class AffinityManagerApp:
         style.configure('TLabelframe.Label', background=BG_MAIN, foreground=TEXT_BRIGHT)
         style.configure('TButton', background=BTN_BG, foreground=BTN_FG, 
                        borderwidth=1, focuscolor='none', padding=6)
-        style.map('TButton', background=[('active', '#2ea043')])
+        style.map('TButton', background=[('active', '#2ea043'), ('disabled', '#1f1f1f')],
+                  foreground=[('disabled', '#666666')])
     
-    def refresh_processes(self):
-        """Refresh all process lists including custom programs."""
-        # Clear custom groups proc lists
-        for name in self.custom_groups:
-            patterns = self.custom_groups[name][0]
-            procs = find_processes(patterns)
-            selector = self.custom_groups[name][2]
-            self.custom_groups[name] = (patterns, procs, selector)
+    def refresh_processes_sync(self):
+        """Synchronously discover known programs and top CPU process in single pass."""
+        self.active_groups.clear()
         
-        # Collect all known PIDs
-        all_known = []
-        for name, (patterns, procs, _) in self.custom_groups.items():
-            all_known.extend(procs)
+        # Single pass discovery
+        results, top_cpu = discover_all_processes_single_pass()
         
-        known_pids = {p['pid'] for p in all_known}
-        self.other_procs = find_other_processes(known_pids)
+        all_pids = set()
+        
+        # Add discovered categories
+        for name, procs in results.items():
+            if procs:  # Only add if running
+                all_pids.update(p['pid'] for p in procs)
+                self.active_groups[name] = (KNOWN_PATTERNS[name], procs, None, None)
+        
+        # Add top CPU process
+        if top_cpu:
+            top_name = f"Top CPU ({top_cpu[0]['name']})"
+            all_pids.add(top_cpu[0]['pid'])
+            self.active_groups[top_name] = ([], top_cpu, None, None)
+        
+        self.known_pids = all_pids
     
-    def load_current_affinities(self):
-        """Set selectors to show current affinity instead of recommended."""
-        for name, (patterns, procs, selector) in self.custom_groups.items():
-            if procs:
-                # Use first process's affinity as representative
-                cores = sorted(procs[0]['cores'])
-                if cores:
-                    selector.set_range(cores[0], cores[-1])
-        
-        # Set "Other" to all cores by default
+    def start_async_other_discovery(self):
+        """Start async discovery of 'Other' processes."""
+        debug_ts("start_async_other_discovery start")
+        self.other_discovery_done = False
         if hasattr(self, 'other_selector'):
-            self.other_selector.set_range(0, self.cpu_info['logical'] - 1)
+            self.other_selector.configure(state='disabled')
+        if hasattr(self, 'apply_btn'):
+            self.apply_btn.configure(state='disabled')
+        
+        def discover():
+            debug_ts("async discover thread started")
+            time.sleep(0.1)  # Small delay to let UI render
+            debug_ts("calling find_other_processes")
+            self.other_procs = find_other_processes(self.known_pids)
+            debug_ts(f"find_other_processes done, found {len(self.other_procs)}")
+            self.other_discovery_done = True
+            
+            # Update UI on main thread
+            self.root.after(0, self.on_other_discovery_complete)
+            debug_ts("async discover thread done")
+        
+        debug_ts("creating thread")
+        thread = threading.Thread(target=discover, daemon=True)
+        debug_ts("starting thread")
+        thread.start()
+        debug_ts("start_async_other_discovery done")
+    
+    def on_other_discovery_complete(self):
+        """Called when async discovery completes."""
+        if hasattr(self, 'apply_btn'):
+            self.apply_btn.configure(state='normal')
+        self.update_other_label()
+        self.status_label.config(text="Ready")
     
     def build_gui(self):
         # Create main scrollable frame
@@ -519,175 +601,147 @@ class AffinityManagerApp:
         self.detect_frame = ttk.LabelFrame(main, text="Detected Processes", padding=10)
         self.detect_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         
-        self.process_labels = {}
-        
         # Core selectors
         self.selector_frame = ttk.LabelFrame(main, text="Core Allocation — click and drag to select range", padding=10)
         self.selector_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         
-        self.selector_row_idx = 0
-        
-        # Build selectors for each custom program
-        for name, patterns in self.custom_programs.items():
-            self.add_program_selector(name, patterns)
+        self.build_selectors()
         
         # "Other" processes selector
         other_row = ttk.Frame(self.selector_frame)
-        other_row.grid(row=self.selector_row_idx, column=0, sticky='w', pady=4)
-        ttk.Label(other_row, text="Other", font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
+        other_row.grid(row=len(self.active_groups), column=0, sticky='w', pady=4)
+        ttk.Label(other_row, text="Other", font=('Segoe UI', 10, 'bold'), width=25, anchor='w').pack(side='left')
         self.other_selector = CoreSelector(other_row, self.cpu_info)
         self.other_selector.pack(side='left', padx=(5, 0))
-        self.selector_row_idx += 1
         
-        self.update_process_labels()
-        
-        # Add program button
-        add_frame = ttk.Frame(main)
-        add_frame.grid(row=5, column=0, columnspan=2, pady=(0, 10))
-        ttk.Button(add_frame, text="+ Add Custom Program", command=self.on_add_program).pack()
+        # Disclaimer
+        disclaimer_frame = ttk.Frame(main)
+        disclaimer_frame.grid(row=5, column=0, columnspan=2, pady=(0, 10))
+        disclaimer_text = ("⚠️ NOT GUARANTEED TO IMPROVE PERFORMANCE • RESTART PROCESS = SETTINGS REVERT!\n"
+                          "This tool compartmentalizes CPU load to prevent one process from slowing another.\n"
+                          "If no background processes are intensive, this may not help you at all.")
+        ttk.Label(disclaimer_frame, text=disclaimer_text, font=('Segoe UI', 8), 
+                 foreground=TEXT_DIM, justify='center').pack()
         
         # Buttons
         btn_frame = ttk.Frame(main)
         btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
         
         ttk.Button(btn_frame, text="↻ Refresh", command=self.on_refresh).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="✓ Apply", command=self.on_apply).pack(side="left", padx=5)
+        self.apply_btn = ttk.Button(btn_frame, text="✓ Apply", command=self.on_apply, state='disabled')
+        self.apply_btn.pack(side="left", padx=5)
         
         # Status
-        self.status_label = ttk.Label(main, text="Ready - showing current affinity settings", font=('Segoe UI', 9))
+        self.status_label = ttk.Label(main, text="Loading other processes...", font=('Segoe UI', 9))
         self.status_label.grid(row=7, column=0, columnspan=2)
     
-    def add_program_selector(self, name, patterns):
-        """Add a program selector row."""
-        # Find processes
-        procs = find_processes(patterns)
-        
-        # Create selector row
-        row = ttk.Frame(self.selector_frame)
-        row.grid(row=self.selector_row_idx, column=0, sticky='w', pady=4)
-        
-        label_frame = ttk.Frame(row)
-        label_frame.pack(side='left')
-        ttk.Label(label_frame, text=name, font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
-        
-        # Add remove button for custom (non-default) programs
-        if name not in DEFAULT_CUSTOM_PROGRAMS:
-            ttk.Button(label_frame, text="✕", width=2, command=lambda: self.remove_program(name)).pack(side='left', padx=(2, 0))
-        
-        selector = CoreSelector(row, self.cpu_info)
-        selector.pack(side='left', padx=(5, 0))
-        
-        # Store in custom_groups
-        self.custom_groups[name] = (patterns, procs, selector)
-        
-        # Create label in detect frame
-        label = ttk.Label(self.detect_frame, text="")
-        label.grid(row=len(self.process_labels), column=0, sticky="w")
-        self.process_labels[name] = label
-        
-        self.selector_row_idx += 1
+    def build_selectors(self):
+        """Build selector rows for active groups."""
+        row_idx = 0
+        for name, (patterns, procs, _, _) in self.active_groups.items():
+            row = ttk.Frame(self.selector_frame)
+            row.grid(row=row_idx, column=0, sticky='w', pady=4)
+            
+            ttk.Label(row, text=name, font=('Segoe UI', 10, 'bold'), width=25, anchor='w').pack(side='left')
+            
+            selector = CoreSelector(row, self.cpu_info)
+            selector.pack(side='left', padx=(5, 0))
+            
+            # Create label in detect frame
+            label = ttk.Label(self.detect_frame, text="")
+            label.grid(row=row_idx, column=0, sticky="w")
+            
+            # Update active_groups with selector and label
+            self.active_groups[name] = (patterns, procs, selector, label)
+            self.update_process_label(name)
+            
+            row_idx += 1
     
-    def remove_program(self, name):
-        """Remove a custom program."""
-        if name in DEFAULT_CUSTOM_PROGRAMS:
-            messagebox.showwarning("Cannot Remove", "Cannot remove default programs.")
-            return
-        
-        if messagebox.askyesno("Confirm", f"Remove {name}?"):
-            del self.custom_programs[name]
-            del self.custom_groups[name]
-            save_custom_programs(self.custom_programs)
-            
-            # Rebuild GUI
-            for widget in self.selector_frame.winfo_children():
-                widget.destroy()
-            for widget in self.detect_frame.winfo_children():
-                widget.destroy()
-            
-            self.process_labels = {}
-            self.selector_row_idx = 0
-            
-            for pname, patterns in self.custom_programs.items():
-                self.add_program_selector(pname, patterns)
-            
-            # Re-add Other
-            other_row = ttk.Frame(self.selector_frame)
-            other_row.grid(row=self.selector_row_idx, column=0, sticky='w', pady=4)
-            ttk.Label(other_row, text="Other", font=('Segoe UI', 10, 'bold'), width=10).pack(side='left')
-            self.other_selector = CoreSelector(other_row, self.cpu_info)
-            self.other_selector.pack(side='left', padx=(5, 0))
-            
-            self.refresh_processes()
-            self.update_process_labels()
-    
-    def on_add_program(self):
-        """Add a new custom program."""
-        name = simpledialog.askstring("Add Program", "Enter program name:")
-        if not name:
-            return
-        
-        if name in self.custom_programs:
-            messagebox.showwarning("Duplicate", "Program already exists.")
-            return
-        
-        pattern = simpledialog.askstring("Add Program", f"Enter process name pattern for {name}:\n(e.g., chrome, firefox.exe)")
-        if not pattern:
-            return
-        
-        patterns = [p.strip() for p in pattern.split(',')]
-        self.custom_programs[name] = patterns
-        save_custom_programs(self.custom_programs)
-        
-        # Add selector
-        self.add_program_selector(name, patterns)
-        self.refresh_processes()
-        self.update_process_labels()
-        self.status_label.config(text=f"Added {name}")
-    
-    def update_process_labels(self):
-        def fmt(name, procs):
-            if not procs:
-                return f"❌ {name}: Not running"
+    def update_process_label(self, name):
+        """Update process label for a group."""
+        patterns, procs, selector, label = self.active_groups[name]
+        if not procs:
+            label.config(text=f"❌ {name}: Not running")
+        else:
             names = set(p['name'] for p in procs)
             threads = sum(p['threads'] for p in procs)
-            return f"✅ {name}: {', '.join(names)} ({threads} threads)"
+            label.config(text=f"✅ {name}: {', '.join(names)} ({threads} threads)")
+    
+    def update_other_label(self):
+        """Update the Other processes label."""
+        count = len(self.other_procs)
+        threads = sum(p['threads'] for p in self.other_procs)
         
-        for name, (patterns, procs, selector) in self.custom_groups.items():
-            if name in self.process_labels:
-                self.process_labels[name].config(text=fmt(name, procs))
+        # Find or create Other label
+        found = False
+        for child in self.detect_frame.winfo_children():
+            if isinstance(child, ttk.Label):
+                text = child.cget('text')
+                if 'Other:' in text or (not text and not found):
+                    if self.other_procs:
+                        child.config(text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
+                    else:
+                        child.config(text="❌ Other: none")
+                    found = True
+                    break
         
-        # Update Other label
-        if hasattr(self, 'other_procs'):
-            count = len(self.other_procs)
-            threads = sum(p['threads'] for p in self.other_procs)
-            if self.other_procs:
-                # Find or create Other label in detect_frame
-                found = False
-                for child in self.detect_frame.winfo_children():
-                    if isinstance(child, ttk.Label):
-                        text = child.cget('text')
-                        if 'Other:' in text or (not text and not found):
-                            child.config(text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
-                            found = True
-                            break
-                
-                if not found:
-                    # Create new label if not found
-                    label = ttk.Label(self.detect_frame, text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
-                    label.grid(row=len(self.process_labels), column=0, sticky="w")
+        if not found and self.other_procs:
+            label = ttk.Label(self.detect_frame, text=f"✅ Other: {count} processes ({threads} threads) — excludes system processes")
+            label.grid(row=len(self.active_groups), column=0, sticky="w")
     
     def on_refresh(self):
-        self.refresh_processes()
-        self.update_process_labels()
-        self.load_current_affinities()
-        self.status_label.config(text="Refreshed!")
+        # Clear selectors
+        for widget in self.selector_frame.winfo_children():
+            widget.destroy()
+        for widget in self.detect_frame.winfo_children():
+            widget.destroy()
+        
+        self.refresh_processes_sync()
+        self.build_selectors()
+        
+        # Re-add Other selector
+        other_row = ttk.Frame(self.selector_frame)
+        other_row.grid(row=len(self.active_groups), column=0, sticky='w', pady=4)
+        ttk.Label(other_row, text="Other", font=('Segoe UI', 10, 'bold'), width=25, anchor='w').pack(side='left')
+        self.other_selector = CoreSelector(other_row, self.cpu_info)
+        self.other_selector.pack(side='left', padx=(5, 0))
+        
+        self.start_async_other_discovery()
+        self.status_label.config(text="Refreshing...")
+    
+    def validate_other_affinity(self, cores, threads):
+        """Check if Other affinity settings are reasonable."""
+        if not cores:
+            return True, None
+        
+        # Check if only E-cores selected
+        has_p_core = any(self.cpu_info['core_types'][c] == 'P' for c in cores)
+        if not has_p_core and self.cpu_info['p_count'] > 0:
+            return False, ("⚠️ WARNING: You've selected only E-cores for 'Other' processes.\n\n"
+                          "This may cause performance issues for background tasks that need performance cores.\n\n"
+                          "Continue anyway?")
+        
+        # Check threads per core ratio
+        threads_per_core = threads / len(cores) if len(cores) > 0 else 0
+        if threads_per_core > MAX_THREADS_PER_CORE:
+            return False, (f"⚠️ WARNING: Thread density is very high ({threads_per_core:.0f} threads/core).\n\n"
+                          f"This exceeds the recommended maximum of {MAX_THREADS_PER_CORE} threads/core "
+                          "and may cause thread contention issues.\n\n"
+                          "Consider selecting more cores or applying to fewer processes.\n\n"
+                          "Continue anyway?")
+        
+        return True, None
     
     def on_apply(self):
+        if not self.other_discovery_done:
+            messagebox.showwarning("Not Ready", "Still discovering processes, please wait...")
+            return
+        
         all_results = []
         errors = []
         
-        # Apply for each custom program
-        for name, (patterns, procs, selector) in self.custom_groups.items():
+        # Apply for each active group
+        for name, (patterns, procs, selector, label) in self.active_groups.items():
             cores = selector.get_cores()
             if not procs or not cores:
                 continue
@@ -702,9 +756,17 @@ class AffinityManagerApp:
             for f in failed:
                 errors.append(f"❌ {f['name']} (PID {f['pid']}):\n   {f['error']}")
         
-        # Apply for Other
-        if hasattr(self, 'other_procs') and self.other_procs:
+        # Apply for Other with validation
+        if self.other_procs:
             cores = self.other_selector.get_cores()
+            threads = sum(p['threads'] for p in self.other_procs)
+            
+            valid, warning_msg = self.validate_other_affinity(cores, threads)
+            if not valid:
+                response = messagebox.askyesno("Warning", warning_msg)
+                if not response:
+                    return  # User cancelled
+            
             if cores:
                 results = set_affinity_with_debug(self.other_procs, cores, "Other")
                 ok = sum(1 for r in results if r['success'])
@@ -745,12 +807,17 @@ def run_as_admin():
 
 def main():
     try:
+        debug_ts("main() start")
         if not is_admin():
+            debug_ts("not admin, elevating")
             run_as_admin()
             return
         
+        debug_ts("is admin, creating Tk root")
         root = tk.Tk()
+        debug_ts("Tk root created, creating app")
         app = AffinityManagerApp(root)
+        debug_ts("app created, entering mainloop")
         root.mainloop()
     except Exception as e:
         import traceback
